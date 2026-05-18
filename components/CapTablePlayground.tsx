@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   CapTableState,
   Loan,
@@ -60,8 +60,104 @@ function defaultState(): CapTableState {
   };
 }
 
+const STORAGE_KEY = "cap-table-state";
+
+interface ScenarioTemplate {
+  label: string;
+  description: string;
+  build: () => CapTableState;
+}
+
+const SCENARIO_TEMPLATES: ScenarioTemplate[] = [
+  {
+    label: "Clean slate",
+    description: "Empty company config only",
+    build: () => ({
+      config: { authorisedCapital: 10_00_000, faceValue: 10, currentFMV: 10 },
+      shareholders: [],
+      loans: [],
+      esop: { enabled: false, percent: 0.1 },
+    }),
+  },
+  {
+    label: "2 Founders (default)",
+    description: "Standard 50-50 founder split",
+    build: defaultState,
+  },
+  {
+    label: "Pre-seed with Angel",
+    description: "2 founders + 1 angel investor at FMV",
+    build: () => ({
+      config: { authorisedCapital: 10_00_000, faceValue: 10, currentFMV: 100 },
+      shareholders: [
+        { id: shortId(), name: "Founder A", type: "founder", shares: 5000, pricePerShare: 10 },
+        { id: shortId(), name: "Founder B", type: "founder", shares: 5000, pricePerShare: 10 },
+        { id: shortId(), name: "Angel Investor", type: "investor", shares: 500, pricePerShare: 100 },
+      ],
+      loans: [],
+      esop: { enabled: false, percent: 0.1 },
+    }),
+  },
+  {
+    label: "Post-seed with ESOP",
+    description: "2 founders + 1 investor + 10% ESOP pool",
+    build: () => ({
+      config: { authorisedCapital: 25_00_000, faceValue: 10, currentFMV: 250 },
+      shareholders: [
+        { id: shortId(), name: "Founder A", type: "founder", shares: 5000, pricePerShare: 10 },
+        { id: shortId(), name: "Founder B", type: "founder", shares: 5000, pricePerShare: 10 },
+        { id: shortId(), name: "Seed Investor", type: "investor", shares: 1000, pricePerShare: 250 },
+      ],
+      loans: [],
+      esop: { enabled: true, percent: 0.1 },
+    }),
+  },
+  {
+    label: "3 Co-founders + Advisor",
+    description: "3 equal founders + 1 advisor",
+    build: () => ({
+      config: { authorisedCapital: 10_00_000, faceValue: 10, currentFMV: 100 },
+      shareholders: [
+        { id: shortId(), name: "Co-founder A", type: "founder", shares: 3333, pricePerShare: 10 },
+        { id: shortId(), name: "Co-founder B", type: "founder", shares: 3333, pricePerShare: 10 },
+        { id: shortId(), name: "Co-founder C", type: "founder", shares: 3334, pricePerShare: 10 },
+        { id: shortId(), name: "Advisor", type: "advisor", shares: 200, pricePerShare: 10 },
+      ],
+      loans: [],
+      esop: { enabled: false, percent: 0.1 },
+    }),
+  },
+];
+
+function loadFromStorage(): CapTableState | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    // Basic shape check
+    if (parsed && parsed.config && Array.isArray(parsed.shareholders)) {
+      // Ensure esop exists (backwards compat)
+      if (!parsed.esop) parsed.esop = { enabled: false, percent: 0.1 };
+      return parsed as CapTableState;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 export default function CapTablePlayground() {
-  const [state, setState] = useState<CapTableState>(defaultState());
+  const [state, setState] = useState<CapTableState>(() => loadFromStorage() || defaultState());
+
+  // Persist state to localStorage on every change
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    } catch {
+      // Silently ignore storage errors
+    }
+  }, [state]);
 
   const derived = useMemo(() => deriveCapTable(state), [state]);
 
@@ -128,8 +224,51 @@ export default function CapTablePlayground() {
 
   function reset() {
     if (confirm("Reset everything to the default 2-founder setup?")) {
+      try { localStorage.removeItem(STORAGE_KEY); } catch {}
       setState(defaultState());
     }
+  }
+
+  function loadScenario(template: ScenarioTemplate) {
+    setState(template.build());
+  }
+
+  function convertLoanToEquity(loanId: string, atFMV: boolean) {
+    setState((s) => {
+      const loan = s.loans.find((l) => l.id === loanId);
+      if (!loan) return s;
+      const price = atFMV ? s.config.currentFMV : s.config.faceValue;
+      const shares = price > 0 ? loan.amount / price : 0;
+      const newShareholder: Shareholder = {
+        id: shortId(),
+        name: loan.lender,
+        type: "founder",
+        shares: Math.round(shares),
+        pricePerShare: price,
+        note: `Converted from loan of ${formatINR(loan.amount)}`,
+      };
+      return {
+        ...s,
+        loans: s.loans.filter((l) => l.id !== loanId),
+        shareholders: [...s.shareholders, newShareholder],
+      };
+    });
+  }
+
+  function updateEsop(patch: Partial<CapTableState["esop"]>) {
+    setState((s) => ({ ...s, esop: { ...s.esop, ...patch } }));
+  }
+
+  function quickFixAuthorisedCapital() {
+    setState((s) => {
+      const paidUp = s.shareholders.reduce((a, sh) => a + sh.shares * s.config.faceValue, 0);
+      const doubled = paidUp * 2;
+      // Round up to nearest lakh (1,00,000)
+      const lakh = 1_00_000;
+      const rounded = Math.ceil(doubled / lakh) * lakh;
+      const newCap = Math.max(rounded, lakh); // at least 1 lakh
+      return { ...s, config: { ...s.config, authorisedCapital: newCap } };
+    });
   }
 
   function exportJSON() {
@@ -230,19 +369,44 @@ export default function CapTablePlayground() {
                   hint="The MOA ceiling. Increase via SH-7."
                   value={state.config.authorisedCapital}
                   onChange={(v) => updateConfig("authorisedCapital", v)}
+                  min={0}
                 />
                 <InputField
                   label="Face value per share (₹)"
                   hint="Standard convention in India is ₹10."
                   value={state.config.faceValue}
                   onChange={(v) => updateConfig("faceValue", v)}
+                  min={1}
                 />
                 <InputField
                   label="Current FMV per share (₹)"
                   hint="Per-share market value. Used for tax warnings & infusion modelling."
                   value={state.config.currentFMV}
                   onChange={(v) => updateConfig("currentFMV", v)}
+                  min={0}
                 />
+              </div>
+            </div>
+
+            {/* Scenario Templates */}
+            <div className="card p-5">
+              <div className="flex items-center gap-2 mb-3">
+                <h3 className="text-sm font-semibold text-ink-100">
+                  Scenario templates
+                </h3>
+                <span className="label-chip">Quick start</span>
+              </div>
+              <div className="grid grid-cols-1 gap-2">
+                {SCENARIO_TEMPLATES.map((t) => (
+                  <button
+                    key={t.label}
+                    onClick={() => loadScenario(t)}
+                    className="btn-ghost text-left text-xs flex flex-col items-start gap-0.5"
+                  >
+                    <span className="font-medium text-ink-200">{t.label}</span>
+                    <span className="text-ink-500 text-[10px]">{t.description}</span>
+                  </button>
+                ))}
               </div>
             </div>
 
@@ -289,6 +453,50 @@ export default function CapTablePlayground() {
               </div>
             </div>
 
+            {/* ESOP Pool */}
+            <div className="card p-5">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-sm font-semibold text-ink-100">
+                  ESOP Pool
+                </h3>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <span className="text-xs text-ink-400">
+                    {state.esop.enabled ? "Enabled" : "Disabled"}
+                  </span>
+                  <button
+                    onClick={() => updateEsop({ enabled: !state.esop.enabled })}
+                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                      state.esop.enabled ? "bg-brand-500" : "bg-ink-700"
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform ${
+                        state.esop.enabled ? "translate-x-4" : "translate-x-1"
+                      }`}
+                    />
+                  </button>
+                </label>
+              </div>
+              {state.esop.enabled && (
+                <div>
+                  <InputField
+                    label="Pool size (% of fully diluted)"
+                    hint="Standard: 10-15%. Computed as post-pool percentage."
+                    value={state.esop.percent * 100}
+                    onChange={(v) => updateEsop({ percent: Math.min(99, Math.max(0, v)) / 100 })}
+                    min={0}
+                    max={99}
+                  />
+                  {derived.totals.esopShares > 0 && (
+                    <p className="mt-2 text-[11px] text-ink-400">
+                      Pool size: <span className="text-ink-200 font-mono">{formatNumber(derived.totals.esopShares)}</span> shares
+                      {" "}/ Fully diluted: <span className="text-ink-200 font-mono">{formatNumber(derived.totals.fullyDilutedShares)}</span> shares
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+
             {/* Loans */}
             <div className="card p-5">
               <div className="flex items-center justify-between mb-4">
@@ -301,6 +509,11 @@ export default function CapTablePlayground() {
               </div>
               <p className="text-xs text-ink-400 mb-3">
                 Loans add cash without dilution. Sec 73(2) declaration required.
+                {derived.totals.annualInterest > 0 && (
+                  <span className="block mt-1 text-amber-300/80">
+                    Annual interest liability: <span className="font-mono">{formatINR(derived.totals.annualInterest)}</span>
+                  </span>
+                )}
               </p>
               <div className="space-y-3">
                 {state.loans.map((l) => (
@@ -309,6 +522,7 @@ export default function CapTablePlayground() {
                     loan={l}
                     onChange={(patch) => updateLoan(l.id, patch)}
                     onRemove={() => removeLoan(l.id)}
+                    onConvert={(atFMV) => convertLoanToEquity(l.id, atFMV)}
                   />
                 ))}
               </div>
@@ -321,7 +535,7 @@ export default function CapTablePlayground() {
           {/* Output column */}
           <div className="lg:col-span-3 space-y-6">
             {/* Summary KPIs */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
               <Kpi label="Total shares" value={formatNumber(derived.totals.shares)} />
               <Kpi
                 label="Paid-up capital"
@@ -335,6 +549,10 @@ export default function CapTablePlayground() {
               <Kpi
                 label="Director loans"
                 value={compactINR(derived.totals.loanTotal)}
+              />
+              <Kpi
+                label="Annual interest"
+                value={compactINR(derived.totals.annualInterest)}
               />
             </div>
 
@@ -421,7 +639,7 @@ export default function CapTablePlayground() {
             </div>
 
             {/* Authorised capital headroom */}
-            <HeadroomBox derived={derived} />
+            <HeadroomBox derived={derived} onQuickFix={quickFixAuthorisedCapital} />
           </div>
         </div>
 
@@ -441,11 +659,15 @@ function InputField({
   value,
   hint,
   onChange,
+  min,
+  max,
 }: {
   label: string;
   value: number;
   hint?: string;
   onChange: (v: number) => void;
+  min?: number;
+  max?: number;
 }) {
   return (
     <div>
@@ -454,7 +676,14 @@ function InputField({
         type="number"
         className="input mt-1.5 font-mono"
         value={Number.isFinite(value) ? value : 0}
-        onChange={(e) => onChange(Number(e.target.value) || 0)}
+        min={min}
+        max={max}
+        onChange={(e) => {
+          let v = Number(e.target.value) || 0;
+          if (min !== undefined && v < min) v = min;
+          if (max !== undefined && v > max) v = max;
+          onChange(v);
+        }}
       />
       {hint && <p className="mt-1 text-[11px] text-ink-500">{hint}</p>}
     </div>
@@ -508,10 +737,12 @@ function ShareholderRow({
           </label>
           <input
             type="number"
+            min={0}
             value={shareholder.shares}
-            onChange={(e) =>
-              onChange({ shares: Number(e.target.value) || 0 })
-            }
+            onChange={(e) => {
+              const v = Math.max(0, Number(e.target.value) || 0);
+              onChange({ shares: v });
+            }}
             className="input mt-1 !py-1.5 font-mono text-xs"
           />
         </div>
@@ -521,10 +752,12 @@ function ShareholderRow({
           </label>
           <input
             type="number"
+            min={0}
             value={shareholder.pricePerShare}
-            onChange={(e) =>
-              onChange({ pricePerShare: Number(e.target.value) || 0 })
-            }
+            onChange={(e) => {
+              const v = Math.max(0, Number(e.target.value) || 0);
+              onChange({ pricePerShare: v });
+            }}
             className="input mt-1 !py-1.5 font-mono text-xs"
           />
         </div>
@@ -555,11 +788,15 @@ function LoanRow({
   loan,
   onChange,
   onRemove,
+  onConvert,
 }: {
   loan: Loan;
   onChange: (patch: Partial<Loan>) => void;
   onRemove: () => void;
+  onConvert: (atFMV: boolean) => void;
 }) {
+  const [showConvert, setShowConvert] = useState(false);
+
   return (
     <div className="rounded-xl border border-ink-800 bg-ink-950/40 p-3 space-y-2">
       <div className="flex items-center gap-2">
@@ -581,8 +818,12 @@ function LoanRow({
           </label>
           <input
             type="number"
+            min={0}
             value={loan.amount}
-            onChange={(e) => onChange({ amount: Number(e.target.value) || 0 })}
+            onChange={(e) => {
+              const v = Math.max(0, Number(e.target.value) || 0);
+              onChange({ amount: v });
+            }}
             className="input mt-1 !py-1.5 font-mono text-xs"
           />
         </div>
@@ -592,14 +833,52 @@ function LoanRow({
           </label>
           <input
             type="number"
+            min={0}
+            max={100}
             value={loan.interestRate ?? 0}
-            onChange={(e) =>
-              onChange({ interestRate: Number(e.target.value) || 0 })
-            }
+            onChange={(e) => {
+              let v = Number(e.target.value) || 0;
+              v = Math.max(0, Math.min(100, v));
+              onChange({ interestRate: v });
+            }}
             className="input mt-1 !py-1.5 font-mono text-xs"
           />
         </div>
       </div>
+      {!showConvert ? (
+        <button
+          onClick={() => setShowConvert(true)}
+          className="btn-ghost text-[10px] w-full mt-1"
+        >
+          Convert to equity
+        </button>
+      ) : (
+        <div className="rounded-lg border border-ink-700 bg-ink-900/60 p-2 space-y-2 mt-1">
+          <p className="text-[10px] text-ink-400">
+            Convert this loan to equity shares. Choose the conversion price:
+          </p>
+          <div className="flex gap-2">
+            <button
+              onClick={() => { onConvert(false); setShowConvert(false); }}
+              className="btn-ghost text-[10px] flex-1"
+            >
+              At face value
+            </button>
+            <button
+              onClick={() => { onConvert(true); setShowConvert(false); }}
+              className="btn-ghost text-[10px] flex-1"
+            >
+              At FMV
+            </button>
+          </div>
+          <button
+            onClick={() => setShowConvert(false)}
+            className="text-[10px] text-ink-500 hover:text-ink-300 w-full text-center"
+          >
+            Cancel
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -632,7 +911,7 @@ function Kpi({
 function StackedBar({
   rows,
 }: {
-  rows: Array<Shareholder & { percent: number }>;
+  rows: Array<Shareholder & { percent: number; virtual?: boolean }>;
 }) {
   const sorted = [...rows].sort((a, b) => b.percent - a.percent);
   return (
@@ -672,8 +951,10 @@ function StackedBar({
 
 function HeadroomBox({
   derived,
+  onQuickFix,
 }: {
   derived: ReturnType<typeof deriveCapTable>;
+  onQuickFix: () => void;
 }) {
   const usedPct = Math.min(
     100,
@@ -682,6 +963,7 @@ function HeadroomBox({
       : 0
   );
   const overLimit = derived.authorised.overLimit;
+  const showQuickFix = overLimit || usedPct > 90;
 
   return (
     <div className="card p-5">
@@ -743,6 +1025,14 @@ function HeadroomBox({
           </div>
         </div>
       </div>
+      {showQuickFix && (
+        <button
+          onClick={onQuickFix}
+          className="mt-3 btn-ghost text-xs w-full border-amber-500/30 text-amber-200 hover:bg-amber-500/10"
+        >
+          Quick-fix: Increase authorised capital
+        </button>
+      )}
     </div>
   );
 }

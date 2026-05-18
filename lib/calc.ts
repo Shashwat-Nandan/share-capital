@@ -1,13 +1,29 @@
 import { CapTableState, Shareholder } from "./types";
 
+export interface DerivedRow {
+  id: string;
+  name: string;
+  type: string;
+  shares: number;
+  pricePerShare: number;
+  note?: string;
+  percent: number;
+  investment: number;
+  premium: number;
+  virtual?: boolean; // true for ESOP pool reserved row
+}
+
 export interface DerivedCapTable {
-  rows: Array<Shareholder & { percent: number; investment: number; premium: number }>;
+  rows: Array<Shareholder & { percent: number; investment: number; premium: number; virtual?: boolean }>;
   totals: {
     shares: number;
     investment: number;
     paidUpCapital: number;
     securitiesPremium: number;
     loanTotal: number;
+    esopShares: number;
+    fullyDilutedShares: number;
+    annualInterest: number;
   };
   authorised: {
     capital: number;
@@ -22,20 +38,44 @@ export interface DerivedCapTable {
 }
 
 export function deriveCapTable(state: CapTableState): DerivedCapTable {
-  const { config, shareholders, loans } = state;
+  const { config, shareholders, loans, esop } = state;
   const totalShares = shareholders.reduce((a, s) => a + s.shares, 0);
 
-  const rows = shareholders.map((s) => {
+  // ESOP pool calculation: percent is post-pool, so esopShares = percent / (1 - percent) * totalShares
+  const esopEnabled = esop && esop.enabled && esop.percent > 0 && esop.percent < 1;
+  const esopShares = esopEnabled ? (esop.percent / (1 - esop.percent)) * totalShares : 0;
+  const fullyDilutedShares = totalShares + esopShares;
+
+  // Use fully diluted shares for percentage if ESOP is enabled
+  const denominator = esopEnabled ? fullyDilutedShares : totalShares;
+
+  const rows: Array<Shareholder & { percent: number; investment: number; premium: number; virtual?: boolean }> = shareholders.map((s) => {
     const investment = s.shares * s.pricePerShare;
     const premium = s.shares * Math.max(0, s.pricePerShare - config.faceValue);
-    const percent = totalShares > 0 ? s.shares / totalShares : 0;
+    const percent = denominator > 0 ? s.shares / denominator : 0;
     return { ...s, percent, investment, premium };
   });
 
-  const investment = rows.reduce((a, r) => a + r.investment, 0);
-  const paidUpCapital = rows.reduce((a, r) => a + r.shares * config.faceValue, 0);
-  const securitiesPremium = rows.reduce((a, r) => a + r.premium, 0);
+  // Add ESOP pool virtual row if enabled
+  if (esopEnabled && esopShares > 0) {
+    rows.push({
+      id: "__esop_pool__",
+      name: "ESOP Pool (reserved)",
+      type: "esop" as Shareholder["type"],
+      shares: Math.round(esopShares),
+      pricePerShare: config.faceValue,
+      percent: denominator > 0 ? esopShares / denominator : 0,
+      investment: 0,
+      premium: 0,
+      virtual: true,
+    });
+  }
+
+  const investment = rows.filter(r => !r.virtual).reduce((a, r) => a + r.investment, 0);
+  const paidUpCapital = rows.filter(r => !r.virtual).reduce((a, r) => a + r.shares * config.faceValue, 0);
+  const securitiesPremium = rows.filter(r => !r.virtual).reduce((a, r) => a + r.premium, 0);
   const loanTotal = loans.reduce((a, l) => a + l.amount, 0);
+  const annualInterest = loans.reduce((a, l) => a + l.amount * ((l.interestRate || 0) / 100), 0);
 
   const maxShares = config.faceValue > 0 ? Math.floor(config.authorisedCapital / config.faceValue) : 0;
   const sharesRemaining = Math.max(0, maxShares - totalShares);
@@ -44,6 +84,14 @@ export function deriveCapTable(state: CapTableState): DerivedCapTable {
   const overLimit = totalShares > maxShares;
 
   const warnings: string[] = [];
+
+  // Face value 0 warning
+  if (config.faceValue === 0) {
+    warnings.push(
+      `Face value is ₹0. This would cause division issues and is not valid for share issuance.`
+    );
+  }
+
   if (overLimit) {
     warnings.push(
       `You've issued ${totalShares.toLocaleString("en-IN")} shares but authorised capital only allows ${maxShares.toLocaleString("en-IN")}. File SH-7 to increase authorised capital.`
@@ -84,6 +132,9 @@ export function deriveCapTable(state: CapTableState): DerivedCapTable {
       paidUpCapital,
       securitiesPremium,
       loanTotal,
+      esopShares: Math.round(esopShares),
+      fullyDilutedShares: Math.round(fullyDilutedShares),
+      annualInterest,
     },
     authorised: {
       capital: config.authorisedCapital,
